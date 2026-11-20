@@ -2,6 +2,8 @@
 
 **Simple Certificate Manager for FileMaker Server** lets you install and automate Let's Encrypt SSL certificates with a single command — using secure DNS validation and built-in FileMaker Server scheduling.
 
+> **Upgrading from 1.x?** Version 2 is a breaking change. Don't upgrade in place: [remove the old install and start fresh](#upgrading-from-1x).
+
 ## Quick Install
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DanSmith888/simple-certificate-manager/main/install.sh -o /tmp/install.sh && sudo bash /tmp/install.sh && rm /tmp/install.sh
@@ -56,14 +58,15 @@ This same command works for:
 - **Maintenance-free** - Once configured, the schedule just works regardless of certificate state
 
 **Decision Logic:**
-1. **Check State**: Read previous certificate status from JSON state file
+1. **Check the certificate on disk**: Does one exist for this hostname, and which Let's Encrypt environment issued it?
 2. **Check Expiry**: Calculate days until current certificate expires
 3. **Smart Decisions**:
    - If certificate expires in >30 days: Skip renewal (still valid)
    - If certificate expires in ≤30 days: Run certbot to renew
    - If hostname changed - request new certificate for new domain now
-   - If environment changed (staging↔live) - request new certificate now
+   - If environment changed (staging↔live) - delete the old certificate and request a new one now
    - If `--force-renew` is set request new certificate regardless of expiry
+4. **Import when needed**: With `--import-cert`, the certificate is imported whenever it differs from the one last imported. A failed import is retried on the next run.
    
 
 **Timeline Example:**
@@ -115,7 +118,7 @@ This same command works for:
 - `letsencrypt.log` - Certbot DNS challenge and certificate operations
 
 **State File** at `/opt/FileMaker/FileMaker Server/CStore/Certbot/simple-certificate-manager-state.json`:
-- Tracks certificate status, hostname, and environment
+- Tracks hostname, environment, the current certificate and the certificate last imported into FileMaker Server
 
 ### Script Parameters
 
@@ -174,6 +177,30 @@ Choose one:
 > **Note:** This probably works on older Ubuntu and FileMaker Server versions but is untested. You may need to modify the scripts to bypass version checks if using older versions. macOS will not run these scripts.
 
 
+## Upgrading from 1.x
+
+Version 2 installs the script in a root-owned location, changes the state file and changes how the schedule calls the script. Remove the old install and run the installer again. The certificate already imported into FileMaker Server stays in place while you do this.
+
+1. In FileMaker Server Admin Console → Configuration → Schedules, delete the `Simple Certificate Manager` schedule. Its parameters hold your DNS token and Admin Console password, so copy them somewhere safe first if you don't have them elsewhere.
+
+2. Remove the old script, sudo rule, certbot data, state file and logs:
+
+```bash
+sudo rm -f "/opt/FileMaker/FileMaker Server/Data/Scripts/simple-certificate-manager.sh"
+sudo rm -f /etc/sudoers.d/90-fmserver
+sudo rm -rf "/opt/FileMaker/FileMaker Server/CStore/Certbot"
+sudo rm -f /etc/certbot/digitalocean.ini /etc/certbot/linode.ini
+```
+
+3. Run the [Quick Install](#quick-install) command again and let it create the new schedule.
+
+4. Run the new schedule once. It starts in staging, as before. You already know your DNS setup works, so you can add `--live` to the schedule parameters before the first run to go straight to a trusted certificate.
+
+Things to know:
+- Step 2 deletes the old certificates, private keys and Let's Encrypt account kept by this tool. A new certificate is requested on the next run, which counts towards the Let's Encrypt limit of 5 duplicate certificates per week.
+- `CStore/Certbot` is also the folder Claris's own Let's Encrypt scripts use. If you use those as well, don't delete it without checking what is in there.
+- FileMaker Server restarts after the new certificate is imported if the schedule has `--restart-fms`.
+
 ## Manual Usage
 
 If you prefer manual setup:
@@ -182,16 +209,21 @@ If you prefer manual setup:
 # 1. Install dependencies
 sudo apt install -y certbot python3-certbot-dns-digitalocean python3-certbot-dns-route53 python3-certbot-dns-linode curl jq openssl
 
-# 2. Copy script to FileMaker Server
-sudo cp simple-certificate-manager.sh /opt/FileMaker/FileMaker\ Server/Data/Scripts/
-sudo chmod +x /opt/FileMaker/FileMaker\ Server/Data/Scripts/simple-certificate-manager.sh
+# 2. Install the script, owned by root
+sudo install -o root -g root -m 755 simple-certificate-manager.sh /usr/local/sbin/simple-certificate-manager.sh
 
-# 3. Configure sudo for fmserver user
-echo "fmserver ALL=(ALL) NOPASSWD: /opt/FileMaker/FileMaker\ Server/Data/Scripts/simple-certificate-manager.sh" | sudo tee /etc/sudoers.d/90-fmserver
+# 3. Add a launcher that FileMaker schedules can run
+printf '%s\n' '#!/bin/bash' 'exec sudo -n /usr/local/sbin/simple-certificate-manager.sh "$@"' \
+  | sudo tee "/opt/FileMaker/FileMaker Server/Data/Scripts/simple-certificate-manager.sh" > /dev/null
+sudo chmod 755 "/opt/FileMaker/FileMaker Server/Data/Scripts/simple-certificate-manager.sh"
+sudo chown fmserver:fmsadmin "/opt/FileMaker/FileMaker Server/Data/Scripts/simple-certificate-manager.sh"
+
+# 4. Configure sudo for fmserver user
+echo "fmserver ALL=(root) NOPASSWD: /usr/local/sbin/simple-certificate-manager.sh" | sudo tee /etc/sudoers.d/90-fmserver
 sudo chmod 440 /etc/sudoers.d/90-fmserver
 
-# 4. Run the script manually or from a FileMaker schedule
-sudo ./simple-certificate-manager.sh --hostname yourdomain.com --email admin@yourdomain.com --dns-provider digitalocean --do-token your_token --fms-username admin --fms-password password --live --import-cert --restart-fms
+# 5. Run the script manually or from a FileMaker schedule
+sudo /usr/local/sbin/simple-certificate-manager.sh --hostname yourdomain.com --email admin@yourdomain.com --dns-provider digitalocean --do-token your_token --fms-username admin --fms-password password --live --import-cert --restart-fms
 ```
 
 
