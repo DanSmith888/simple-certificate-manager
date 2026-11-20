@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # FileMaker Server Certificate Manager
-# Unified script for Let's Encrypt certificate management with DigitalOcean DNS
+# Unified script for Let's Encrypt certificate management using DNS validation
 # Supports both certificate requests and renewals
 
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="2.0.0"
 SCRIPT_NAME="simple-certificate-manager"
 SCRIPT_AUTHOR="Daniel Smith"
 SCRIPT_GITHUB="https://github.com/DanSmith888/simple-certificate-manager"
@@ -27,12 +27,15 @@ RESTART_FMS=false
 STAGING=true
 LIVE=false
 DNS_PROVIDER=""  # Will be set by --dns-provider parameter (digitalocean, route53, or linode)
+DNS_CREDENTIALS_DIR="/etc/certbot"
+DNS_CREDENTIALS_FILE=""  # Set by setup_dns_credentials, removed on exit
+DNS_PLUGIN_ARGS=()       # Certbot plugin flags for the chosen provider
 
 # ACME server endpoints
 PROD_SERVER_URL="https://acme-v02.api.letsencrypt.org/directory"
 STAGING_SERVER_URL="https://acme-staging-v02.api.letsencrypt.org/directory"
 
-# Check if running on Ubuntu 24.04 LTS or above
+# Check if running on Ubuntu 22.04 LTS or above
 check_ubuntu() {
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
@@ -42,7 +45,7 @@ check_ubuntu() {
         
         # Check if version is 22.04 or above
         if ! dpkg --compare-versions "$VERSION_ID" ge "22.04"; then
-            error_exit "This script requires Ubuntu 24.04 LTS or above"
+            error_exit "This script requires Ubuntu 22.04 LTS or above"
         fi
     else
         error_exit "Cannot detect operating system"
@@ -108,6 +111,14 @@ check_dependencies() {
     if ! command -v certbot &> /dev/null; then
         error_exit "Certbot is not installed. Please run: sudo apt install certbot"
     fi
+
+    # jq reads and writes the state file, openssl reads certificate fingerprints
+    local tool
+    for tool in jq openssl; do
+        if ! command -v "$tool" &> /dev/null; then
+            error_exit "$tool is not installed. Please run: sudo apt install $tool"
+        fi
+    done
     
     # Check DNS provider plugin
     case "$DNS_PROVIDER" in
@@ -141,82 +152,102 @@ check_dependencies() {
 
 # Create necessary directories
 setup_directories() {
-    # Create certbot directory
-    mkdir -p "$FMS_CERTBOT_PATH"
-    
-    # Create logs directory
-    mkdir -p "$FMS_LOG_PATH"
-    
-    # Set proper ownership and permissions
+    mkdir -p "$FMS_CERTBOT_PATH" "$FMS_LOG_PATH"
+
+    # FileMaker Server reads the certificate files as fmserver during import
     if id "fmserver" &>/dev/null; then
-        chown -R fmserver:fmsadmin "$FMS_CERTBOT_PATH" 2>/dev/null || true
-        chmod -R 755 "$FMS_CERTBOT_PATH" 2>/dev/null || true
+        chown -R fmserver:fmsadmin "$FMS_CERTBOT_PATH"
     fi
-    
-    # Ensure log file exists and is writable
-    touch "$FMS_LOG_PATH/cert-manager.log" 2>/dev/null || true
-    if id "fmserver" &>/dev/null; then
-        chown fmserver:fmsadmin "$FMS_LOG_PATH/cert-manager.log" 2>/dev/null || true
-        chmod 644 "$FMS_LOG_PATH/cert-manager.log" 2>/dev/null || true
+    chmod 755 "$FMS_CERTBOT_PATH" "$FMS_LOG_PATH"
+
+    # Private keys and the ACME account stay owner-only, as certbot creates them
+    local private_dir
+    for private_dir in accounts archive live; do
+        if [[ -d "$FMS_CERTBOT_PATH/$private_dir" ]]; then
+            chmod 700 "$FMS_CERTBOT_PATH/$private_dir"
+        fi
+    done
+    if [[ -d "$FMS_CERTBOT_PATH/archive" ]]; then
+        find "$FMS_CERTBOT_PATH/archive" -type f -name 'privkey*.pem' -exec chmod 600 {} +
     fi
+
+    touch "$FMS_LOG_PATH/cert-manager.log"
+    chmod 644 "$FMS_LOG_PATH/cert-manager.log"
 }
 
-# Setup DNS provider credentials (temporary)
+# Write the provider credentials file so it is never readable by other users
+write_credentials_file() {
+    local content="$1"
+
+    mkdir -p "$DNS_CREDENTIALS_DIR"
+    rm -f "$DNS_CREDENTIALS_FILE"
+    (umask 077 && printf '%s\n' "$content" > "$DNS_CREDENTIALS_FILE")
+}
+
+# Setup DNS provider credentials (temporary, removed again on exit)
 setup_dns_credentials() {
     log_info "Setting up $DNS_PROVIDER credentials..."
-    
-    # Create certbot directory if it doesn't exist
-    mkdir -p "/etc/certbot"
-    
+
     case "$DNS_PROVIDER" in
         "digitalocean")
-            local dns_ini="/etc/certbot/digitalocean.ini"
-            cat > "$dns_ini" << EOF
-dns_digitalocean_token = $DO_TOKEN
-EOF
-            chmod 600 "$dns_ini"
-            log_success "DigitalOcean credentials configured"
+            DNS_CREDENTIALS_FILE="$DNS_CREDENTIALS_DIR/digitalocean.ini"
+            write_credentials_file "dns_digitalocean_token = $DO_TOKEN"
+            DNS_PLUGIN_ARGS=(--dns-digitalocean --dns-digitalocean-credentials "$DNS_CREDENTIALS_FILE")
             ;;
         "route53")
-            # Route53 uses environment variables, set them for certbot
-            export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
-            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
-            log_success "Route53 credentials configured (using environment variables)"
+            # The Route53 plugin reads its credentials from the environment
+            export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+            DNS_PLUGIN_ARGS=(--dns-route53)
             ;;
         "linode")
-            local dns_ini="/etc/certbot/linode.ini"
-            cat > "$dns_ini" << EOF
-dns_linode_key = $LINODE_TOKEN
-EOF
-            chmod 600 "$dns_ini"
-            log_success "Linode credentials configured"
+            DNS_CREDENTIALS_FILE="$DNS_CREDENTIALS_DIR/linode.ini"
+            write_credentials_file "dns_linode_key = $LINODE_TOKEN"
+            DNS_PLUGIN_ARGS=(--dns-linode --dns-linode-credentials "$DNS_CREDENTIALS_FILE")
             ;;
     esac
+
+    log_success "$DNS_PROVIDER credentials configured"
 }
 
-# Ensure existing lineage (if any) matches target environment; delete if server differs
-ensure_lineage_matches_environment() {
+# ACME server this run targets
+expected_acme_server() {
+    if [[ "$LIVE" == "true" ]]; then
+        echo "$PROD_SERVER_URL"
+    else
+        echo "$STAGING_SERVER_URL"
+    fi
+}
+
+# ACME server recorded in the existing lineage (empty if there is none)
+get_lineage_server() {
     local hostname="$1"
-    local expected_server
     local renewal_conf="$FMS_CERTBOT_PATH/renewal/$hostname.conf"
 
-    if [[ "$LIVE" == "true" ]]; then
-        expected_server="$PROD_SERVER_URL"
-    else
-        expected_server="$STAGING_SERVER_URL"
-    fi
-
     if [[ -f "$renewal_conf" ]]; then
-        local configured_server
-        configured_server="$(grep -E '^server\s*=' "$renewal_conf" | awk -F'=' '{gsub(/^ *| *$/, \"\", $2); print $2}' || true)"
-        if [[ -n "$configured_server" ]] && [[ "$configured_server" != "$expected_server" ]]; then
-            log_info "ACME server mismatch for '$hostname' (found: $configured_server, expected: $expected_server) - deleting old lineage"
-            # Delete existing lineage so we can recreate it against the correct server
-            certbot delete --non-interactive --cert-name "$hostname" \
-                --config-dir "$FMS_CERTBOT_PATH" \
-                --work-dir "$FMS_CERTBOT_PATH" \
-                --logs-dir "$FMS_LOG_PATH" >/dev/null 2>&1 || true
-        fi
+        awk -F'=' '/^server[ \t]*=/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' "$renewal_conf"
+    fi
+}
+
+# True when the existing lineage was issued by the environment this run targets
+lineage_matches_environment() {
+    local hostname="$1"
+    local configured_server
+    configured_server=$(get_lineage_server "$hostname")
+
+    [[ -z "$configured_server" || "$configured_server" == "$(expected_acme_server)" ]]
+}
+
+# Certbot keeps an existing lineage when asked for the same hostname again, so a
+# lineage from the other ACME server has to be deleted before requesting.
+delete_lineage() {
+    local hostname="$1"
+
+    log_info "Deleting existing certificate lineage for '$hostname'"
+    if ! certbot delete --non-interactive --cert-name "$hostname" \
+        --config-dir "$FMS_CERTBOT_PATH" \
+        --work-dir "$FMS_CERTBOT_PATH" \
+        --logs-dir "$FMS_LOG_PATH" >> "$FMS_LOG_PATH/cert-manager.log" 2>&1; then
+        error_exit "Could not delete the existing lineage for '$hostname'. Check $FMS_LOG_PATH/cert-manager.log"
     fi
 }
 
@@ -236,57 +267,35 @@ ensure_lineage_autorenew_enabled() {
     fi
 }
 
-# Cleanup DNS provider credentials
+# Remove DNS provider credentials. Runs from the EXIT trap, so it must be safe
+# to call at any point, including before the credentials were written.
 cleanup_dns_credentials() {
-    log_info "Cleaning up $DNS_PROVIDER credentials..."
-    
-    case "$DNS_PROVIDER" in
-        "digitalocean")
-            local dns_ini="/etc/certbot/digitalocean.ini"
-            # Remove credentials file
-            if [[ -f "$dns_ini" ]]; then
-                rm -f "$dns_ini"
-                log_success "DigitalOcean credentials cleaned up"
-            fi
-            ;;
-        "route53")
-            # Route53 uses environment variables, unset them for security
-            unset AWS_ACCESS_KEY_ID
-            unset AWS_SECRET_ACCESS_KEY
-            log_success "Route53 credentials cleaned up (environment variables unset)"
-            ;;
-        "linode")
-            local dns_ini="/etc/certbot/linode.ini"
-            # Remove credentials file
-            if [[ -f "$dns_ini" ]]; then
-                rm -f "$dns_ini"
-                log_success "Linode credentials cleaned up"
-            fi
-            ;;
-    esac
+    if [[ -n "$DNS_CREDENTIALS_FILE" && -f "$DNS_CREDENTIALS_FILE" ]]; then
+        rm -f "$DNS_CREDENTIALS_FILE"
+        log_info "Removed $DNS_PROVIDER credentials file"
+    fi
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 }
 
 # Cleanup FileMaker Server certbot files for testing
 cleanup_all() {
     echo "[INFO] Cleaning up FileMaker Server certbot files..."
-    
+
     # Remove FileMaker Server certbot directory
-    if [[ -d "$FMS_CERTBOT_PATH" ]]; then
+    if [[ -n "$FMS_CERTBOT_PATH" && -d "$FMS_CERTBOT_PATH" ]]; then
         rm -rf "$FMS_CERTBOT_PATH"
         echo "[SUCCESS] Removed: $FMS_CERTBOT_PATH"
     fi
-    
-    # Remove DNS provider credentials
-    if [[ -f "/etc/certbot/digitalocean.ini" ]]; then
-        rm -f "/etc/certbot/digitalocean.ini"
-        echo "[SUCCESS] Removed: /etc/certbot/digitalocean.ini"
-    fi
-    
-    if [[ -f "/etc/certbot/route53.ini" ]]; then
-        rm -f "/etc/certbot/route53.ini"
-        echo "[SUCCESS] Removed: /etc/certbot/route53.ini"
-    fi
-    
+
+    # Remove DNS provider credentials left behind by an interrupted run
+    local credentials_file
+    for credentials_file in "$DNS_CREDENTIALS_DIR/digitalocean.ini" "$DNS_CREDENTIALS_DIR/linode.ini"; do
+        if [[ -f "$credentials_file" ]]; then
+            rm -f "$credentials_file"
+            echo "[SUCCESS] Removed: $credentials_file"
+        fi
+    done
+
     echo "[SUCCESS] Cleanup complete! FileMaker Server certbot files have been removed."
     echo "[INFO] You can now run the script fresh for testing."
 }
@@ -298,54 +307,52 @@ get_state_file() {
 
 # Read state from file
 read_state() {
-    local state_file=$(get_state_file)
-    
-    if [[ -f "$state_file" ]]; then
-        # Read state from JSON file
-        STATE_HOSTNAME=$(jq -r '.hostname' "$state_file" 2>/dev/null || echo "")
-        STATE_STAGING=$(jq -r '.staging' "$state_file" 2>/dev/null || echo "false")
-        STATE_EMAIL=$(jq -r '.email' "$state_file" 2>/dev/null || echo "")
-        STATE_LAST_RUN=$(jq -r '.last_run' "$state_file" 2>/dev/null || echo "")
-        STATE_CERT_EXISTS=$(jq -r '.cert_exists' "$state_file" 2>/dev/null || echo "false")
-        STATE_CERT_FINGERPRINT=$(jq -r '.cert_fingerprint' "$state_file" 2>/dev/null || echo "")
-    else
-        # No state file exists
-        STATE_HOSTNAME=""
-        STATE_STAGING="false"
-        STATE_EMAIL=""
-        STATE_LAST_RUN=""
-        STATE_CERT_EXISTS="false"
-        STATE_CERT_FINGERPRINT=""
+    local state_file
+    state_file=$(get_state_file)
+
+    STATE_HOSTNAME=""
+    STATE_STAGING=""
+    STATE_CERT_FINGERPRINT=""
+    STATE_IMPORTED_FINGERPRINT=""
+
+    if [[ ! -f "$state_file" ]]; then
+        return 0
     fi
+
+    if ! jq -e . "$state_file" >/dev/null 2>&1; then
+        log_warn "State file is not valid JSON, treating this as a first run: $state_file"
+        return 0
+    fi
+
+    STATE_HOSTNAME=$(jq -r '.hostname // ""' "$state_file")
+    STATE_STAGING=$(jq -r '.staging // ""' "$state_file")
+    STATE_CERT_FINGERPRINT=$(jq -r '.cert_fingerprint // ""' "$state_file")
+    STATE_IMPORTED_FINGERPRINT=$(jq -r '.imported_fingerprint // ""' "$state_file")
 }
 
 # Write state to file
 write_state() {
     local hostname="$1"
-    local email="$2"
-    local staging="$3"
-    local cert_exists="$4"
-    local cert_fingerprint="$5"
-    local state_file=$(get_state_file)
+    local staging="$2"
+    local cert_fingerprint="$3"
+    local imported_fingerprint="$4"
+    local state_file
+    state_file=$(get_state_file)
 
-    # Create state JSON
-    cat > "$state_file" << EOF
-{
-    "hostname": "$hostname",
-    "email": "$email",
-    "staging": "$staging",
-    "last_run": "$(date -Iseconds)",
-    "cert_exists": "$cert_exists",
-    "cert_fingerprint": "$cert_fingerprint"
-}
-EOF
-    
-    # Set proper permissions
+    jq -n \
+        --arg hostname "$hostname" \
+        --arg staging "$staging" \
+        --arg last_run "$(date -Iseconds)" \
+        --arg cert_fingerprint "$cert_fingerprint" \
+        --arg imported_fingerprint "$imported_fingerprint" \
+        '{hostname: $hostname, staging: $staging, last_run: $last_run, cert_fingerprint: $cert_fingerprint, imported_fingerprint: $imported_fingerprint}' \
+        > "$state_file"
+
     chmod 600 "$state_file"
     if id "fmserver" &>/dev/null; then
-        chown fmserver:fmsadmin "$state_file" 2>/dev/null || true
+        chown fmserver:fmsadmin "$state_file"
     fi
-    
+
     log_debug "State written to $state_file"
 }
 
@@ -373,34 +380,18 @@ get_cert_expiry() {
     fi
 }
 
-# Get certificate fingerprint
+# Get certificate fingerprint (empty if the certificate is missing or unreadable)
 get_cert_fingerprint() {
     local hostname="$1"
     local cert_file="$FMS_CERTBOT_PATH/live/$hostname/fullchain.pem"
-    
+
     if [[ -f "$cert_file" ]]; then
-        openssl x509 -in "$cert_file" -noout -fingerprint -sha256 | cut -d= -f2
+        # Callers treat an empty result as "no certificate", so a failed read must not abort here
+        openssl x509 -in "$cert_file" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true
     else
         echo ""
     fi
 }
-
-# Check if certificate was actually renewed
-certificate_was_renewed() {
-    local hostname="$1"
-    local current_fingerprint=$(get_cert_fingerprint "$hostname")
-    
-    if [[ -n "$current_fingerprint" ]] && [[ -n "$STATE_CERT_FINGERPRINT" ]]; then
-        if [[ "$current_fingerprint" != "$STATE_CERT_FINGERPRINT" ]]; then
-            return 0  # Certificate was renewed (fingerprint changed)
-        else
-            return 1  # Certificate was not renewed (same fingerprint)
-        fi
-    else
-        return 1  # No certificate or no previous fingerprint
-    fi
-}
-
 # Check if certificate needs renewal
 cert_needs_renewal() {
     local hostname="$1"
@@ -441,59 +432,29 @@ cert_needs_renewal() {
 request_certificate() {
     local hostname="$1"
     local email="$2"
-    
+    local server
+    server=$(expected_acme_server)
+
     log_info "Requesting new certificate for $hostname using $DNS_PROVIDER"
-    
-    # Build certbot command
-    local certbot_cmd="certbot certonly"
-    
-    # Add DNS provider specific options
-    case "$DNS_PROVIDER" in
-        "digitalocean")
-            certbot_cmd="$certbot_cmd --dns-digitalocean"
-            certbot_cmd="$certbot_cmd --dns-digitalocean-credentials /etc/certbot/digitalocean.ini"
-            ;;
-        "route53")
-            certbot_cmd="$certbot_cmd --dns-route53"
-            # Set environment variables for Route53
-            export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
-            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
-            ;;
-        "linode")
-            certbot_cmd="$certbot_cmd --dns-linode"
-            certbot_cmd="$certbot_cmd --dns-linode-credentials /etc/certbot/linode.ini"
-            ;;
-    esac
-    
-    certbot_cmd="$certbot_cmd --agree-tos --non-interactive"
-    certbot_cmd="$certbot_cmd --email $email"
-    certbot_cmd="$certbot_cmd -d $hostname"
-    certbot_cmd="$certbot_cmd --config-dir \"$FMS_CERTBOT_PATH\""
-    certbot_cmd="$certbot_cmd --work-dir \"$FMS_CERTBOT_PATH\""
-    certbot_cmd="$certbot_cmd --logs-dir \"$FMS_LOG_PATH\""
-    
-    # Add explicit ACME server based on environment
     if [[ "$LIVE" == "true" ]]; then
-        certbot_cmd="$certbot_cmd --server $PROD_SERVER_URL"
         log_info "Using Let's Encrypt production environment"
     else
-        certbot_cmd="$certbot_cmd --server $STAGING_SERVER_URL"
         log_info "Using Let's Encrypt staging environment add --live to use production environment"
     fi
-    
-    # Execute certbot
-    log_debug "Running: $certbot_cmd"
-    if eval "$certbot_cmd"; then
-        # Set proper permissions on certificate files
-        local cert_file="$FMS_CERTBOT_PATH/live/$hostname/fullchain.pem"
-        local key_file="$FMS_CERTBOT_PATH/live/$hostname/privkey.pem"
-        
-        if [[ -f "$cert_file" ]] && [[ -f "$key_file" ]]; then
-            chown fmserver:fmsadmin "$cert_file" "$key_file"
-            chmod 644 "$cert_file"
-            chmod 600 "$key_file"
-        fi
-        
+
+    local -a certbot_cmd=(
+        certbot certonly "${DNS_PLUGIN_ARGS[@]}"
+        --agree-tos --non-interactive
+        --email "$email"
+        -d "$hostname"
+        --config-dir "$FMS_CERTBOT_PATH"
+        --work-dir "$FMS_CERTBOT_PATH"
+        --logs-dir "$FMS_LOG_PATH"
+        --server "$server"
+    )
+
+    log_debug "Running: ${certbot_cmd[*]}"
+    if "${certbot_cmd[@]}"; then
         log_success "Certificate requested successfully"
         return 0
     else
@@ -505,54 +466,27 @@ request_certificate() {
 # Renew existing certificate
 renew_certificate() {
     local hostname="$1"
-    
+
     log_info "Renewing certificate for $hostname using $DNS_PROVIDER"
-    
-    # Build certbot command
-    local certbot_cmd="certbot renew"
-    
-    # Add DNS provider specific options
-    case "$DNS_PROVIDER" in
-        "digitalocean")
-            certbot_cmd="$certbot_cmd --dns-digitalocean"
-            certbot_cmd="$certbot_cmd --dns-digitalocean-credentials /etc/certbot/digitalocean.ini"
-            ;;
-        "route53")
-            certbot_cmd="$certbot_cmd --dns-route53"
-            # Set environment variables for Route53
-            export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
-            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
-            ;;
-        "linode")
-            certbot_cmd="$certbot_cmd --dns-linode"
-            certbot_cmd="$certbot_cmd --dns-linode-credentials /etc/certbot/linode.ini"
-            ;;
-    esac
-    
-    certbot_cmd="$certbot_cmd --agree-tos --non-interactive"
-    certbot_cmd="$certbot_cmd --cert-name $hostname"
-    certbot_cmd="$certbot_cmd --config-dir \"$FMS_CERTBOT_PATH\""
-    certbot_cmd="$certbot_cmd --work-dir \"$FMS_CERTBOT_PATH\""
-    certbot_cmd="$certbot_cmd --logs-dir \"$FMS_LOG_PATH\""
-    
-    # Add force renewal if requested
+
+    # Renewal uses the ACME server stored in the lineage, which main has
+    # already checked against the requested environment.
+    local -a certbot_cmd=(
+        certbot renew "${DNS_PLUGIN_ARGS[@]}"
+        --non-interactive
+        --cert-name "$hostname"
+        --config-dir "$FMS_CERTBOT_PATH"
+        --work-dir "$FMS_CERTBOT_PATH"
+        --logs-dir "$FMS_LOG_PATH"
+    )
+
     if [[ "$FORCE_RENEW" == "true" ]]; then
-        certbot_cmd="$certbot_cmd --force-renewal"
+        certbot_cmd+=(--force-renewal)
         log_info "Force renewal requested"
     fi
-    
-    # Add explicit ACME server based on environment (renew uses lineage's server; this is informational/consistent)
-    if [[ "$LIVE" == "true" ]]; then
-        certbot_cmd="$certbot_cmd --server $PROD_SERVER_URL"
-        log_info "Target environment: production"
-    else
-        certbot_cmd="$certbot_cmd --server $STAGING_SERVER_URL"
-        log_info "Target environment: staging"
-    fi
-    
-    # Execute certbot
-    log_debug "Running: $certbot_cmd"
-    if eval "$certbot_cmd"; then
+
+    log_debug "Running: ${certbot_cmd[*]}"
+    if "${certbot_cmd[@]}"; then
         log_info "Certbot renew completed successfully (certificate may or may not have been reissued)"
         return 0
     else
@@ -564,11 +498,6 @@ renew_certificate() {
 # Import certificate to FileMaker Server
 import_certificate() {
     local hostname="$1"
-    
-    if [[ "$IMPORT_CERT" != "true" ]]; then
-        log_info "Certificate import skipped (--import-cert=false)"
-        return 0
-    fi
     
     log_info "Importing certificate to FileMaker Server"
     
@@ -602,37 +531,28 @@ import_certificate() {
 # Restart FileMaker Server
 restart_filemaker_server() {
     if [[ "$RESTART_FMS" != "true" ]]; then
-        log_info "FileMaker Server restart skipped (--restart-fms=false)"
+        log_info "FileMaker Server restart skipped (--restart-fms not set)"
         return 0
     fi
-    
-    if [[ "$IMPORT_CERT" != "true" ]]; then
-        log_info "FileMaker Server restart skipped (no certificate import performed)"
-        return 0
-    fi
-    
-    log_info "Restarting FileMaker Server..."
-    
- 
-    # Start FileMaker Server in background (script will exit before restart)
+
+    # Restart in the background so this script can finish first: when it runs
+    # from a FileMaker schedule, the restart takes its parent process down.
     log_info "Scheduling FileMaker Server restart in 5 seconds..."
-    nohup bash -c "sleep 5 && systemctl restart fmshelper && echo 'FileMaker Server restarted successfully' >> $FMS_LOG_PATH/cert-manager.log" > /dev/null 2>&1 &
-    
+    nohup bash -c 'sleep 5 && systemctl restart fmshelper && echo "FileMaker Server restarted successfully" >> "$1"' \
+        _ "$FMS_LOG_PATH/cert-manager.log" > /dev/null 2>&1 &
+
     log_success "FileMaker Server restart scheduled"
 }
 
 # Display version information
 show_version() {
-    # Log version check for testing
-    echo "[INFO] Version check requested by user: $(whoami) at $(date)"
-    
     cat << EOF
 $SCRIPT_NAME v$SCRIPT_VERSION
 
 Author: $SCRIPT_AUTHOR
 GitHub: $SCRIPT_GITHUB
 
-A unified script for Let's Encrypt certificate management with DigitalOcean DNS
+A unified script for Let's Encrypt certificate management using DNS validation
 for FileMaker Server. Supports both certificate requests and renewals with
 semi-intelligent state management.
 
@@ -650,8 +570,6 @@ USAGE:
 REQUIRED OPTIONS:
     --hostname HOSTNAME     Domain name for the certificate
     --email EMAIL          Email for Let's Encrypt notifications
-    --fms-username USER     FileMaker Admin Console username
-    --fms-password PASS     FileMaker Admin Console password
     --dns-provider PROVIDER DNS provider: digitalocean, route53, or linode
 
 DNS PROVIDER OPTIONS (choose one):
@@ -664,6 +582,8 @@ OPTIONAL OPTIONS:
     --live                  Use Let's Encrypt production environment (default: staging)
     --force-renew           Force renewal even if not needed
     --import-cert           Import certificate to FileMaker Server
+    --fms-username USER     FileMaker Admin Console username (required with --import-cert)
+    --fms-password PASS     FileMaker Admin Console password (required with --import-cert)
     --restart-fms           Restart FileMaker Server after import (only runs if --import-cert is also set)
     --debug                 Enable debug logging
     --version, -v            Show version information
@@ -691,6 +611,13 @@ EOF
 # Parse command line arguments
 parse_arguments() {
     while [[ $# -gt 0 ]]; do
+        case $1 in
+            --hostname|--email|--do-token|--aws-access-key-id|--aws-secret-key|--linode-token|--dns-provider|--fms-username|--fms-password)
+                if [[ $# -lt 2 ]]; then
+                    error_exit "Option $1 requires a value"
+                fi
+                ;;
+        esac
         case $1 in
             --hostname)
                 DOMAIN_NAME="$2"
@@ -770,27 +697,31 @@ parse_arguments() {
 # Validate required parameters
 validate_parameters() {
     local errors=()
-    
+
+    # Hostname and email end up in file paths and certbot arguments, so only
+    # plain values are accepted.
     if [[ -z "${DOMAIN_NAME:-}" ]]; then
         errors+=("--hostname is required")
+    elif [[ ! "$DOMAIN_NAME" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+        errors+=("--hostname is not a valid domain name: $DOMAIN_NAME")
     fi
-    
+
     if [[ -z "${EMAIL:-}" ]]; then
         errors+=("--email is required")
+    elif [[ ! "$EMAIL" =~ ^[A-Za-z0-9._%+][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+$ ]]; then
+        errors+=("--email is not a valid email address: $EMAIL")
     fi
-    
-    if [[ -z "${FMS_USERNAME:-}" ]]; then
-        errors+=("--fms-username is required")
+
+    if [[ "$IMPORT_CERT" == "true" ]]; then
+        if [[ -z "${FMS_USERNAME:-}" ]]; then
+            errors+=("--fms-username is required with --import-cert")
+        fi
+
+        if [[ -z "${FMS_PASSWORD:-}" ]]; then
+            errors+=("--fms-password is required with --import-cert")
+        fi
     fi
-    
-    if [[ -z "${FMS_PASSWORD:-}" ]]; then
-        errors+=("--fms-password is required")
-    fi
-    
-    if [[ -z "${DNS_PROVIDER:-}" ]]; then
-        errors+=("--dns-provider is required")
-    fi
-    
+
     # Validate DNS provider credentials
     case "$DNS_PROVIDER" in
         "digitalocean")
@@ -811,11 +742,14 @@ validate_parameters() {
                 errors+=("--linode-token is required for Linode DNS")
             fi
             ;;
+        "")
+            errors+=("--dns-provider is required")
+            ;;
         *)
             errors+=("--dns-provider must be 'digitalocean', 'route53', or 'linode'")
             ;;
     esac
-    
+
     if [[ ${#errors[@]} -gt 0 ]]; then
         for error in "${errors[@]}"; do
             log_error "$error"
@@ -828,124 +762,97 @@ validate_parameters() {
 main() {
     # Check prerequisites first (before any logging)
     check_ubuntu
-    
+
     # Setup directories (before any logging)
     setup_directories
-    
+
     log_info "Starting $SCRIPT_NAME v$SCRIPT_VERSION"
     log_debug "Debug mode: $DEBUG"
     log_info "Hostname: $DOMAIN_NAME"
     log_info "Email: $EMAIL"
     log_info "Environment: $([ "$LIVE" == "true" ] && echo "production" || echo "staging")"
-    
+
     # Check remaining prerequisites
     check_dependencies
+
+    # Credentials must not outlive the run, whichever way it ends
+    trap cleanup_dns_credentials EXIT
     setup_dns_credentials
-    
+
     # Read previous state
     read_state
-    log_debug "Previous state - Hostname: $STATE_HOSTNAME, Staging: $STATE_STAGING, Cert exists: $STATE_CERT_EXISTS"
-    
-    # Determine action based on state
-    local action="request"
-    local state_changed=false
-    
-    # Check if this is a different hostname
-    if [[ "$STATE_HOSTNAME" != "$DOMAIN_NAME" ]] && [[ -n "$STATE_HOSTNAME" ]]; then
+    log_debug "Previous state - Hostname: $STATE_HOSTNAME, Staging: $STATE_STAGING, Imported fingerprint: $STATE_IMPORTED_FINGERPRINT"
+
+    local current_staging="true"
+    if [[ "$LIVE" == "true" ]]; then
+        current_staging="false"
+    fi
+
+    if [[ -n "$STATE_HOSTNAME" && "$STATE_HOSTNAME" != "$DOMAIN_NAME" ]]; then
         log_info "Different hostname detected. Previous: $STATE_HOSTNAME, Current: $DOMAIN_NAME"
-        state_changed=true
     fi
-    
-    # Check if environment changed (staging vs live)
-    local current_staging=$([ "$LIVE" == "true" ] && echo "false" || echo "true")
-    if [[ "$STATE_STAGING" != "$current_staging" ]]; then
-        log_info "Environment changed. Previous: $([ "$STATE_STAGING" == "true" ] && echo "staging" || echo "production"), Current: $([ "$current_staging" == "true" ] && echo "staging" || echo "production")"
-        state_changed=true
-    fi
-    
-    # Determine action
-    if [[ "$state_changed" == "true" ]]; then
-        # Always request a new certificate when environment/hostname changed,
-        # even if --force-renew is set, to avoid reusing the wrong ACME server.
-        action="request"
-        log_info "State changed - requesting new certificate"
-    elif certificate_exists "$DOMAIN_NAME"; then
-        if [[ "$FORCE_RENEW" == "true" ]]; then
+
+    # Decide what to do from what is on disk, not from the state file
+    local action
+    if certificate_exists "$DOMAIN_NAME"; then
+        if ! lineage_matches_environment "$DOMAIN_NAME"; then
+            log_info "Existing certificate is from the other Let's Encrypt environment (found: $(get_lineage_server "$DOMAIN_NAME")) - requesting new certificate"
+            delete_lineage "$DOMAIN_NAME"
+            action="request"
+        elif [[ "$FORCE_RENEW" == "true" ]]; then
             action="renew"
             log_info "Force renewal requested - renewing certificate"
         elif cert_needs_renewal "$DOMAIN_NAME"; then
             action="renew"
             log_info "Certificate exists but needs renewal"
         else
+            action="none"
             log_info "Certificate exists and is valid"
-            # Update state with current status
-            local current_fingerprint=$(get_cert_fingerprint "$DOMAIN_NAME")
-            write_state "$DOMAIN_NAME" "$EMAIL" "$current_staging" "true" "$current_fingerprint"
-            cleanup_dns_credentials
-            exit 0
         fi
     else
         action="request"
         log_info "No certificate found - requesting new certificate"
     fi
-    
+
     # Execute action
     case "$action" in
         "request")
-            # Ensure lineage matches target environment; delete existing lineage if ACME server differs
-            ensure_lineage_matches_environment "$DOMAIN_NAME"
-            if request_certificate "$DOMAIN_NAME" "$EMAIL"; then
-                if import_certificate "$DOMAIN_NAME"; then
-                    # Update state after successful request
-                    local new_fingerprint=$(get_cert_fingerprint "$DOMAIN_NAME")
-                    write_state "$DOMAIN_NAME" "$EMAIL" "$current_staging" "true" "$new_fingerprint"
-                    log_success "Certificate request completed successfully"
-                    cleanup_dns_credentials
-                    # Restart FileMaker Server in background (script will exit before restart)
-                    restart_filemaker_server
-                    exit 0
-                else
-                    cleanup_dns_credentials
-                    error_exit "Certificate import failed"
-                fi
-            else
-                cleanup_dns_credentials
-                error_exit "Certificate request failed"
-            fi
+            request_certificate "$DOMAIN_NAME" "$EMAIL" || error_exit "Certificate request failed"
             ;;
         "renew")
             ensure_lineage_autorenew_enabled "$DOMAIN_NAME"
-            if renew_certificate "$DOMAIN_NAME"; then
-                # Check if certificate was actually renewed
-                if certificate_was_renewed "$DOMAIN_NAME"; then
-                    log_success "Certificate renewed successfully"
-                    if import_certificate "$DOMAIN_NAME"; then
-                        # Update state with new fingerprint
-                        local new_fingerprint=$(get_cert_fingerprint "$DOMAIN_NAME")
-                        write_state "$DOMAIN_NAME" "$EMAIL" "$current_staging" "true" "$new_fingerprint"
-                        log_success "Certificate imported successfully"
-                        cleanup_dns_credentials
-                        # Restart FileMaker Server in background (script will exit before restart)
-                        restart_filemaker_server
-                        exit 0
-                    else
-                        cleanup_dns_credentials
-                        error_exit "Certificate import failed"
-                    fi
-                else
-                    log_info "Certificate renewal skipped — certbot did not change the certificate (still within its renewal policy or no reissue needed)"
-                    # Update state but don't import/restart
-                    local current_fingerprint=$(get_cert_fingerprint "$DOMAIN_NAME")
-                    write_state "$DOMAIN_NAME" "$EMAIL" "$current_staging" "true" "$current_fingerprint"
-                    cleanup_dns_credentials
-                    exit 0
-                fi
-            else
-                cleanup_dns_credentials
-                error_exit "Certificate renewal failed"
-            fi
+            renew_certificate "$DOMAIN_NAME" || error_exit "Certificate renewal failed"
             ;;
     esac
+
+    local fingerprint
+    fingerprint=$(get_cert_fingerprint "$DOMAIN_NAME")
+    if [[ -z "$fingerprint" ]]; then
+        error_exit "No readable certificate found for $DOMAIN_NAME in $FMS_CERTBOT_PATH/live"
+    fi
+
+    if [[ "$action" == "renew" && "$fingerprint" == "$STATE_CERT_FINGERPRINT" ]]; then
+        log_info "Certbot did not change the certificate (still within its renewal policy)"
+    fi
+
+    # Import whenever the certificate on disk is not the one FileMaker Server
+    # last imported. This also retries an import that failed on an earlier run.
+    local imported_fingerprint="$STATE_IMPORTED_FINGERPRINT"
+    if [[ "$IMPORT_CERT" != "true" ]]; then
+        log_info "Certificate import skipped (--import-cert not set)"
+    elif [[ "$fingerprint" == "$imported_fingerprint" ]]; then
+        log_info "Certificate is already imported into FileMaker Server"
+    elif import_certificate "$DOMAIN_NAME"; then
+        imported_fingerprint="$fingerprint"
+        write_state "$DOMAIN_NAME" "$current_staging" "$fingerprint" "$imported_fingerprint"
+        restart_filemaker_server
+    else
+        write_state "$DOMAIN_NAME" "$current_staging" "$fingerprint" "$imported_fingerprint"
+        error_exit "Certificate import failed - it will be retried on the next run"
+    fi
+
+    write_state "$DOMAIN_NAME" "$current_staging" "$fingerprint" "$imported_fingerprint"
+    log_success "Certificate manager run completed"
 }
 
 # Script entry point
@@ -957,7 +864,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "[INFO] Auto-escalating to root using sudo"
             exec sudo "$0" "$@"
         else
-            echo "ERROR: This script must be run as root or with sudo. Please run: sudo $0 $*" >&2
+            echo "ERROR: This script must be run as root or with sudo. Please run: sudo $0 [OPTIONS]" >&2
             exit 1
         fi
     fi
