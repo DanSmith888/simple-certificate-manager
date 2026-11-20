@@ -31,7 +31,11 @@ FMS_SCRIPTS_DIR="/opt/FileMaker/FileMaker Server/Data/Scripts"
 FMS_LAUNCHER="$FMS_SCRIPTS_DIR/simple-certificate-manager.sh"
 INSTALLED_SCRIPT="/usr/local/sbin/simple-certificate-manager.sh"
 SUDOERS_FILE="/etc/sudoers.d/90-fmserver"
-SCRIPT_DOWNLOAD_URL="https://raw.githubusercontent.com/DanSmith888/simple-certificate-manager/main/simple-certificate-manager.sh"
+
+# Branch or tag the certificate manager script is downloaded from. Change it
+# with --ref to test a branch before it is merged.
+SCRIPT_REF="main"
+SCRIPT_DOWNLOAD_URL=""
 
 # FileMaker Server Admin API and schedule
 FMS_API="https://localhost/fmi/admin/api/v2"
@@ -447,6 +451,9 @@ install_certificate_manager() {
     # Download to the scratch directory first so a failed or bogus download
     # never replaces a working install
     local download="$INSTALL_TMP/simple-certificate-manager.sh"
+    if [[ "$SCRIPT_REF" != "main" ]]; then
+        log_warn "Installing the script from '$SCRIPT_REF', not from main"
+    fi
     log_info "Downloading certificate manager script..."
     if ! curl -fsSL "$SCRIPT_DOWNLOAD_URL" -o "$download"; then
         log_error "Failed to download script from $SCRIPT_DOWNLOAD_URL"
@@ -860,8 +867,32 @@ show_completion() {
     log_success "Happy certificate managing!"
 }
 
+# Parse command line arguments
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ref)
+                if [[ $# -lt 2 || ! "$2" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+                    log_error "--ref needs a branch or tag name"
+                    exit 1
+                fi
+                SCRIPT_REF="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                log_error "Usage: sudo bash install.sh [--ref BRANCH_OR_TAG]"
+                exit 1
+                ;;
+        esac
+    done
+
+    SCRIPT_DOWNLOAD_URL="https://raw.githubusercontent.com/DanSmith888/simple-certificate-manager/$SCRIPT_REF/simple-certificate-manager.sh"
+}
+
 # Main execution
 main() {
+    parse_arguments "$@"
     show_welcome
     check_root
 
